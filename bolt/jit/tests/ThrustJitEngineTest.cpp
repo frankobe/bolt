@@ -266,7 +266,7 @@ TEST_F(JitEngineTest, concurreny) {
 }
 
 TEST_F(JitEngineTest, cacheEvictionOnEmptyList) {
-  // Bug 2: When a cached module has an external reference (CompiledModuleSP
+  // When a cached module has an external reference (CompiledModuleSP
   // held outside the cache), eviction removes the cache entry but the
   // CompiledModuleImpl isn't destroyed (refcount > 0), so notifyFreeingObject
   // is never called and memory usage doesn't decrease. The eviction loop in
