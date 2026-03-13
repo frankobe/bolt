@@ -705,8 +705,9 @@ class SharedArbitrator : public memory::MemoryArbitrator {
 
   // The map of global arbitration waiters. The key is the arbitration operation
   // id which is set to the id of the corresponding arbitration participant.
-  // This ensures to satisfy the arbitration request in the order of the age of
-  // arbitration participants with old participants being served first.
+  // Older participants (lower ids) are preferred, but younger participants
+  // with small requests (at most minAllocateBytes) may be served first if the
+  // oldest waiter's request cannot be satisfied with available capacity.
   std::map<uint64_t, ArbitrationWait*> globalArbitrationWaiters_;
 
   tsan_atomic<uint64_t> globalArbitrationRuns_{0};

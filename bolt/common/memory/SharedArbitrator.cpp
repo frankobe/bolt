@@ -1104,14 +1104,23 @@ void SharedArbitrator::runGlobalArbitration() {
           shouldReclaimByAbort,
           allParticipantsReclaimed,
           reclaimedBytes);
-      if (shouldReclaimByAbort) {
-        reclaimedBytes = reclaimUsedMemoryByAbort(/*force=*/true);
-      } else {
-        reclaimedBytes = reclaimUsedMemoryBySpill(
-            targetBytes,
-            reclaimedParticipants,
-            failedParticipants,
-            allParticipantsReclaimed);
+      try {
+        if (shouldReclaimByAbort) {
+          reclaimedBytes = reclaimUsedMemoryByAbort(/*force=*/true);
+        } else {
+          reclaimedBytes = reclaimUsedMemoryBySpill(
+              targetBytes,
+              reclaimedParticipants,
+              failedParticipants,
+              allParticipantsReclaimed);
+        }
+      } catch (const std::exception& e) {
+        // Catch any unexpected exception during memory reclamation to prevent
+        // the global arbitration thread from crashing. This can happen when
+        // concurrent task termination races with memory reclamation.
+        BOLT_MEM_LOG(WARNING)
+            << "Exception during global arbitration reclaim: " << e.what();
+        reclaimedBytes = 0;
       }
       totalReclaimedBytes += reclaimedBytes;
       reclaimUnusedCapacity();
@@ -1359,18 +1368,29 @@ uint64_t SharedArbitrator::reclaimUsedMemoryByAbort(bool force) {
   }
   const auto& victim = victimOpt.value();
 
+  // Check if the victim has already been aborted by a concurrent operation
+  // (e.g., another arbitration thread or task termination). If so, skip it
+  // to avoid double-abort which can crash in setAbortError. We check both
+  // the participant's and the pool's aborted flag since the pool can be
+  // aborted through a path that doesn't go through the participant.
+  if (victim.participant->aborted() || victim.participant->pool()->aborted()) {
+    return 0;
+  }
+
   // NOTE: we expect the aborted query will terminate and free up resource soon
   // after abort operation.
   const auto currentCapacity = victim.participant->pool()->capacity();
   try {
+    // Avoid calling pool()->toString() and pool()->treeMemoryUsage() in the
+    // abort error message. These methods traverse the pool tree and can crash
+    // if the pool or its children are being concurrently modified during task
+    // termination or another arbitration operation.
     BOLT_MEM_POOL_ABORTED(fmt::format(
-        "Memory pool aborted to reclaim used memory, current capacity {}, "
-        "requesting capacity from global arbitration {} memory pool "
-        "stats:\n{}\n{}",
+        "Memory pool {} aborted to reclaim used memory, current capacity {}, "
+        "requesting capacity from global arbitration {}",
+        victim.participant->name(),
         succinctBytes(currentCapacity),
-        succinctBytes(victim.participant->globalArbitrationGrowCapacity()),
-        victim.participant->pool()->toString(),
-        victim.participant->pool()->treeMemoryUsage()));
+        succinctBytes(victim.participant->globalArbitrationGrowCapacity())));
   } catch (BoltRuntimeError&) {
     abort(victim.participant, std::current_exception());
     return currentCapacity;
@@ -1417,12 +1437,15 @@ uint64_t SharedArbitrator::reclaim(
                      << " numNonReclaimableAttempts "
                      << stats.numNonReclaimableAttempts;
   if (reclaimedBytes == 0) {
+    // Avoid calling pool()->toString() and pool()->treeMemoryUsage() here as
+    // they traverse the pool tree and can crash if the pool or its children
+    // are being concurrently modified during task termination or abort.
     FB_LOG_EVERY_MS(WARNING, 1'000) << fmt::format(
-        "Nothing reclaimed from memory pool {} with reclaim target {},  memory pool stats:\n{}\n{}",
+        "Nothing reclaimed from memory pool {} with reclaim target {}, "
+        "current capacity {}",
         participant->name(),
         succinctBytes(targetBytes),
-        participant->pool()->toString(),
-        participant->pool()->treeMemoryUsage());
+        succinctBytes(participant->pool()->capacity()));
   }
   return reclaimedBytes;
 }
@@ -1501,7 +1524,13 @@ void SharedArbitrator::resumeGlobalArbitrationWaitersLocked(
         op->maxGrowBytes(),
         op->minGrowBytes());
     if (allocatedBytes == 0) {
-      break;
+      // Skip this waiter and try the next one. A subsequent waiter with a
+      // small enough request (at most minAllocateBytes) may still be served,
+      // since allocateCapacityLocked's fairness guard limits later waiters
+      // to minAllocateBytes when earlier waiters are pending. Breaking here
+      // would cause head-of-line blocking and cascading timeouts.
+      ++it;
+      continue;
     }
     BOLT_CHECK_GE(allocatedBytes, op->requestBytes());
     BOLT_CHECK_EQ(it->second->allocatedBytes, 0);
