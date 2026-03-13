@@ -367,8 +367,14 @@ void ThrustJIT::handleLazyCallThroughError() {
 }
 
 ThrustJIT::~ThrustJIT() {
-  // Clear cached modules before ending session
+  // Clear cached modules before ending session.
+  // This triggers rt->remove() which dispatches async cleanup tasks.
   lruCache_.clear();
+
+  // Wait for all async cleanup tasks to complete before ending the session.
+  // Otherwise, resource trackers become defunct while async tasks still
+  // reference them, causing SEGFAULT.
+  compile_threads_.wait();
 
   if (auto err = execution_session_->endSession()) {
     execution_session_->reportError(std::move(err));
@@ -376,8 +382,6 @@ ThrustJIT::~ThrustJIT() {
   if (auto err = EPCIU->cleanup()) {
     execution_session_->reportError(std::move(err));
   }
-
-  compile_threads_.wait();
 }
 
 ThrustJitMemoryUsageListener::ThrustJitMemoryUsageListener(ThrustJIT* jit)
