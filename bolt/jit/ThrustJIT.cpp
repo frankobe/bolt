@@ -208,15 +208,28 @@ CompiledModuleSP ThrustJIT::CompileModule(
 
   compiledModuleSP->setResourceTracker(std::move(resource_tracker));
 
-  // Add into cache
+  // Add into cache. Collect evicted modules so their resource trackers
+  // are cleaned up outside the lock — rt->remove() is a complex LLVM ORC
+  // operation that may dispatch async tasks to the thread pool and must
+  // not run while cache_mutex_ is held.
+  std::vector<CompiledModuleSP> evicted;
   {
     std::unique_lock lock(cache_mutex_);
-    lruCache_.insert(modId, compiledModuleSP);
+    evicted = lruCache_.insert(modId, compiledModuleSP);
     compilingFns_.erase(modId);
   }
   // In case that others are waiting for the same module to be finished.
   // notify them
   cv_.notify_all();
+
+  // Destroy evicted modules here, outside the lock.
+  // Each destructor calls rt->remove() which frees JIT resources.
+  // Wait for any async tasks dispatched by rt->remove() to complete
+  // before returning, so they don't race with subsequent compilations.
+  if (!evicted.empty()) {
+    evicted.clear();
+    compile_threads_.wait();
+  }
 
   return compiledModuleSP;
 }
@@ -368,12 +381,14 @@ void ThrustJIT::handleLazyCallThroughError() {
 
 ThrustJIT::~ThrustJIT() {
   // Clear cached modules before ending session.
-  // This triggers rt->remove() which dispatches async cleanup tasks.
+  // Each CompiledModuleImpl destructor calls rt->remove() which may
+  // dispatch async cleanup tasks to the thread pool.
   lruCache_.clear();
 
-  // Wait for all async cleanup tasks to complete before ending the session.
-  // Otherwise, resource trackers become defunct while async tasks still
-  // reference them, causing SEGFAULT.
+  // Wait for all async tasks (including those dispatched by rt->remove()
+  // during cache clearing) to complete BEFORE ending the session.
+  // Without this, endSession() marks resource trackers as defunct while
+  // thread pool tasks still reference them, causing SEGFAULT.
   compile_threads_.wait();
 
   if (auto err = execution_session_->endSession()) {

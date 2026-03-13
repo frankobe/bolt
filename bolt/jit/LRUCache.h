@@ -35,6 +35,7 @@
 #include <list>
 #include <optional>
 #include <unordered_map>
+#include <vector>
 
 namespace bytedance::bolt::jit {
 
@@ -64,20 +65,24 @@ class LRUCache {
     return map_.find(key) != map_.end();
   }
 
-  void insert(const key_type& key, const value_type& value) {
+  std::vector<value_type> insert(const key_type& key, const value_type& value) {
+    std::vector<value_type> evicted;
     typename map_type::iterator i = map_.find(key);
     if (i == map_.end()) {
       // insert item into the cache, but first check if it is full
 
       while (!empty() && evictPolicy_()) {
-        // cache is full, evict the least recently used item
-        evict();
+        // cache is full, evict the least recently used item.
+        // Return evicted values so the caller can defer their destruction
+        // to a safe point (e.g., outside a lock).
+        evicted.push_back(evict());
       }
 
       // insert the new item
       list_.push_front(key);
       map_[key] = std::make_pair(value, list_.begin());
     }
+    return evicted;
   }
 
   std::optional<value_type> get(const key_type& key) {
@@ -116,11 +121,13 @@ class LRUCache {
   }
 
  private:
-  void evict() {
+  value_type evict() {
     // evict item from the end of most recently used list
     typename list_type::iterator i = --list_.end();
+    value_type val = std::move(map_[*i].first);
     map_.erase(*i);
     list_.erase(i);
+    return val;
   }
 
   map_type map_;
