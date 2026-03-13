@@ -1442,7 +1442,13 @@ bool Task::addSplitWithSequence(
   }
 
   if (!isTaskRunning) {
-    addRemoteSplit(planNodeId, split);
+    try {
+      addRemoteSplit(planNodeId, split);
+    } catch (const BoltRuntimeError& ex) {
+      LOG(WARNING) << taskId()
+                   << " Failed to add remote split after task termination: "
+                   << ex.what();
+    }
   }
 
   return added;
@@ -1466,7 +1472,13 @@ void Task::addSplit(const core::PlanNodeId& planNodeId, exec::Split&& split) {
 
   if (!isTaskRunning) {
     // Safe because 'split' is moved away above only if 'isTaskRunning'.
-    addRemoteSplit(planNodeId, split);
+    try {
+      addRemoteSplit(planNodeId, split);
+    } catch (const BoltRuntimeError& ex) {
+      LOG(WARNING) << taskId()
+                   << " Failed to add remote split after task termination: "
+                   << ex.what();
+    }
   }
 }
 
