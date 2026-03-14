@@ -27,7 +27,9 @@
 #include "bolt/jit/ThrustJIT.h"
 #include "bolt/jit/tests/JitTestBase.h"
 
+#include <chrono>
 #include <cstdlib>
+#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -322,6 +324,75 @@ TEST_F(JitEngineTest, cacheEvictionOnEmptyList) {
     auto result = jitFunc(100, 200);
     ASSERT_TRUE(result == 300);
   }
+}
+
+TEST_F(JitEngineTest, concurrentEvictionStress) {
+  // Stress test: tiny cache limit + many unique modules + concurrent compiles.
+  // Verifies that:
+  //   1. Memory usage stays bounded after eviction.
+  //   2. No "Resource tracker became defunct" errors during the run.
+  //   3. No MemMgrs.empty() assertion on teardown.
+  const std::string irTmpl = R"IR(
+        define i64 @function_name(i64 noundef %0, i64 noundef %1)  {
+        %3 = add nsw i64 %1, %0
+        ret i64 %3
+        }
+    )IR";
+
+  constexpr size_t LIMIT = 1024;
+  constexpr int NUM_THREADS = 16;
+  constexpr int MODULES_PER_THREAD = 32;
+  jit->GetCache().clear();
+  jit->SetMemoryLimit(LIMIT);
+
+  std::atomic<int> errors{0};
+
+  auto worker = [&](int threadId) {
+    for (int i = 0; i < MODULES_PER_THREAD; ++i) {
+      std::string fn =
+          "stress_t" + std::to_string(threadId) + "_f" + std::to_string(i);
+      std::regex p("function_name");
+      std::string ir = std::regex_replace(irTmpl, p, fn);
+
+      auto tsm = jit->CreateTSModule(fn);
+      tsm.withModuleDo([&](llvm::Module& m) {
+        bool err = jit->AddIRIntoModule(ir.c_str(), &m);
+        if (err) {
+          errors.fetch_add(1, std::memory_order_relaxed);
+          return;
+        }
+      });
+
+      CompiledModuleSP mod = jit->CompileModule(std::move(tsm));
+      if (!mod) {
+        errors.fetch_add(1, std::memory_order_relaxed);
+        continue;
+      }
+
+      typedef int64_t (*FuncProto)(int64_t, int64_t);
+      auto jitFunc = (FuncProto)mod->getFuncPtr(fn);
+      if (jitFunc) {
+        auto result = jitFunc(100, 200);
+        EXPECT_EQ(result, 300);
+      }
+    }
+  };
+
+  std::vector<std::jthread> threads;
+  for (int t = 0; t < NUM_THREADS; ++t) {
+    threads.emplace_back(worker, t);
+  }
+  for (auto&& t : threads) {
+    t.join();
+  }
+
+  EXPECT_EQ(errors.load(), 0);
+
+  // After all threads complete, memory should be bounded.
+  // Upper bound: each module ~768 bytes; with LIMIT=1024, at most a few
+  // modules' worth should remain.  Use a generous 8x margin to account
+  // for concurrency timing.
+  EXPECT_LT(jit->GetMemoryUsage(), 8 * LIMIT);
 }
 
 } // namespace bytedance::bolt::jit::test

@@ -55,6 +55,7 @@
 #include <deque>
 #include <memory>
 #include <string_view>
+#include <unordered_set>
 
 namespace bytedance::bolt::jit {
 
@@ -223,6 +224,11 @@ class ThrustJIT {
     return lruCache_;
   }
 
+  enum class EmitFenceMode { kPerModule, kPerPool, kNone };
+  void SetEmitFenceMode(EmitFenceMode m) {
+    emit_fence_mode_ = m;
+  }
+
  private:
   llvm::Expected<llvm::orc::ThreadSafeModule> optimizeModule(
       llvm::orc::ThreadSafeModule TSM,
@@ -265,6 +271,18 @@ class ThrustJIT {
   std::atomic<size_t> jit_memory_usage_{0};
 
   std::atomic<size_t> jit_memory_usage_limit_{1L << 27};
+
+  std::atomic<bool> shutting_down_{false};
+
+  EmitFenceMode emit_fence_mode_{EmitFenceMode::kPerModule};
+
+  // Per-module emit fence: tracks onObjEmit tasks that have called
+  // NotifyEmitted (unblocking lookup) but haven't finished withResourceKeyDo
+  // (storing the MemMgr in the layer).  waitForEmit() blocks only until the
+  // specific module's onObjEmit task returns — not the entire pool.
+  std::mutex emit_mu_;
+  std::condition_variable emit_cv_;
+  std::unordered_set<uintptr_t> pending_emits_;
 
   std::unique_ptr<ThrustJitMemoryUsageListener> mem_usage_listener_;
 

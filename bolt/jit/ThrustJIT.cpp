@@ -80,12 +80,62 @@ ThrustJIT::ThrustJIT(
   object_layer_.registerJITEventListener(
       *static_cast<llvm::JITEventListener*>(mem_usage_listener_.get()));
 
-  // Set compile concurrency
+  // Per-module emit fence.
+  //
+  // In LLVM 13's onObjEmit the execution order is:
+  //   1. R.notifyEmitted()        – dispatches a *separate* task that unblocks
+  //                                 lookup() on the caller thread
+  //   2. notifyObjectLoaded()     – EventListener callback
+  //   3. NotifyEmitted callback   – ← we hook here to mark "emit in flight"
+  //   4. R.withResourceKeyDo()    – stores MemMgr in MemMgrs map
+  //   5. onObjEmit returns        – T->run() returns
+  //
+  // We mark the key as pending in step 3, and signal completion after step 5
+  // (from the setDispatchTask wrapper). This lets CompileModule wait for just
+  // this module's bookkeeping instead of draining the whole thread pool.
+  //
+  // Thread-local state links steps 3 and 5 because they execute on the same
+  // pool thread within the same T->run() invocation.
+  static thread_local uintptr_t tlsEmitKey = 0;
+  static thread_local bool tlsEmitActive = false;
+
+  object_layer_.setNotifyEmitted(
+      [this](
+          llvm::orc::MaterializationResponsibility& R,
+          std::unique_ptr<llvm::MemoryBuffer>) {
+        // Obtain the ResourceKey under the session lock.  The tracker is still
+        // valid at this point (step 3 precedes step 4 / any eviction).
+        llvm::handleAllErrors(
+            R.withResourceKeyDo([this](llvm::orc::ResourceKey K) {
+              {
+                std::lock_guard lock(emit_mu_);
+                pending_emits_.insert(K);
+              }
+              tlsEmitKey = K;
+              tlsEmitActive = true;
+            }),
+            [](llvm::ErrorInfoBase&) {
+              // Tracker already defunct – nothing to fence on.
+            });
+      });
+
+  // Set compile concurrency and wire the post-task emit fence signal.
   this->execution_session_->setDispatchTask(
       [this](std::unique_ptr<llvm::orc::Task> T) {
-        compile_threads_.async([UnownedT = T.release()]() {
-          std::unique_ptr<llvm::orc::Task> T(UnownedT);
-          T->run();
+        compile_threads_.async([this, unownedT = T.release()]() {
+          std::unique_ptr<llvm::orc::Task> task(unownedT);
+          task->run();
+          // If T was an onObjEmit task, the NotifyEmitted callback above set
+          // tlsEmitActive.  By this point withResourceKeyDo (step 4) has
+          // completed, so we can safely unblock the waiting CompileModule.
+          if (tlsEmitActive) {
+            {
+              std::lock_guard lock(emit_mu_);
+              pending_emits_.erase(tlsEmitKey);
+            }
+            emit_cv_.notify_all();
+            tlsEmitActive = false;
+          }
         });
       });
 }
@@ -160,6 +210,11 @@ CompiledModuleSP ThrustJIT::CompileModule(
     llvm::orc::ThreadSafeModule tsm,
     bool isGobal) { // isBobal = false
 
+  if (emit_fence_mode_ == EmitFenceMode::kPerPool &&
+      shutting_down_.load(std::memory_order_acquire)) {
+    return nullptr;
+  }
+
   llvm::orc::ResourceTrackerSP resource_tracker = createResourceTracker();
 
   std::string modId;
@@ -174,15 +229,17 @@ CompiledModuleSP ThrustJIT::CompileModule(
     }
   });
 
-  auto err = optimize_layer_.add(resource_tracker, std::move(tsm));
-  llvm::handleAllErrors(std::move(err), [&](llvm::ErrorInfoBase& eib) {
-    llvm::errs() << "[JIT] CompileModule Error: " << eib.message() << '\n';
+  if (auto err = optimize_layer_.add(resource_tracker, std::move(tsm))) {
+    llvm::handleAllErrors(std::move(err), [&](llvm::ErrorInfoBase& eib) {
+      llvm::errs() << "[JIT] CompileModule Error: " << eib.message() << '\n';
+    });
     {
       std::unique_lock lock(cache_mutex_);
       compilingFns_.erase(modId);
     }
     cv_.notify_all();
-  });
+    return nullptr;
+  }
 
   auto compiledModuleSP = std::make_shared<CompiledModuleImpl>();
   compiledModuleSP->setKey(modId);
@@ -204,6 +261,24 @@ CompiledModuleSP ThrustJIT::CompileModule(
       cv_.notify_all();
       return nullptr;
     }
+  }
+
+  // Wait until this module's onObjEmit task has finished storing the MemMgr
+  // via withResourceKeyDo.  The fence is signalled from the setDispatchTask
+  // wrapper after T->run() returns.  This blocks only on this resource key,
+  // not the entire thread pool.
+  switch (emit_fence_mode_) {
+    case EmitFenceMode::kPerModule: {
+      auto key = resource_tracker->getKeyUnsafe();
+      std::unique_lock lock(emit_mu_);
+      emit_cv_.wait(lock, [&] { return pending_emits_.count(key) == 0U; });
+      break;
+    }
+    case EmitFenceMode::kPerPool:
+      compile_threads_.wait();
+      break;
+    case EmitFenceMode::kNone:
+      break;
   }
 
   compiledModuleSP->setResourceTracker(std::move(resource_tracker));
@@ -367,7 +442,19 @@ void ThrustJIT::handleLazyCallThroughError() {
 }
 
 ThrustJIT::~ThrustJIT() {
-  // Clear cached modules before ending session
+  // Reject new compilations that use the coarse barrier path — they would
+  // call compile_threads_.wait() and race with the destructor's drain below.
+  shutting_down_.store(true, std::memory_order_release);
+
+  // Wait for all pending thread pool tasks to complete FIRST.
+  // onObjEmit stores MemMgrs via withResourceKeyDo AFTER notifyEmitted
+  // dispatches a separate completion task. If we clear the cache or end
+  // the session before these tasks finish, handleRemoveResources won't
+  // find the MemMgr entries, leaving them orphaned in the layer and
+  // triggering the MemMgrs.empty() assertion in ~RTDyldObjectLinkingLayer.
+  compile_threads_.wait();
+
+  // Now safe to clear: all MemMgrs are properly stored in the layer.
   lruCache_.clear();
 
   if (auto err = execution_session_->endSession()) {
@@ -376,8 +463,6 @@ ThrustJIT::~ThrustJIT() {
   if (auto err = EPCIU->cleanup()) {
     execution_session_->reportError(std::move(err));
   }
-
-  compile_threads_.wait();
 }
 
 ThrustJitMemoryUsageListener::ThrustJitMemoryUsageListener(ThrustJIT* jit)
