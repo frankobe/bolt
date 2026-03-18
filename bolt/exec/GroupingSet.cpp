@@ -1200,6 +1200,7 @@ bool GroupingSet::getOutputWithSpill(
           false,
           true,
           false,
+          false /*useListRowIndex*/,
           &pool_,
           table_->rows()->stringAllocatorShared());
 
@@ -2036,6 +2037,7 @@ void GroupingSet::abandonPartialAggregation() {
       false,
       true,
       false,
+      false /*useListRowIndex*/,
       &pool_,
       table_->rows()->stringAllocatorShared());
   initializeAggregates(aggregates_, *intermediateRows_, true);
