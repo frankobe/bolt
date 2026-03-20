@@ -23,10 +23,13 @@
 #include <llvm/IR/MDBuilder.h>
 #include <llvm/Support/TargetSelect.h>
 #include <llvm/Target/TargetMachine.h>
+#include <mach-o/dyld.h>
 
 #include "bolt/jit/ThrustJIT.h"
 #include "bolt/jit/tests/JitTestBase.h"
 
+#include <spawn.h>
+#include <sys/wait.h>
 #include <chrono>
 #include <cstdlib>
 #include <iomanip>
@@ -36,9 +39,12 @@
 #include <regex>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 
 extern "C" {
+
+extern char** environ;
 
 int64_t extern_test_sum(int64_t a, int64_t b) {
   return a + b;
@@ -49,6 +55,110 @@ extern int jit_StringViewCompareWrapper(char* l, char* r);
 } // ~ extern
 
 namespace bytedance::bolt::jit::test {
+
+namespace {
+
+constexpr size_t kStressLimit = 1024;
+constexpr int kStressThreads = 16;
+constexpr int kStressModulesPerThread = 32;
+constexpr std::string_view kStressFilter =
+    "JitEngineTest.concurrentEvictionStressChild";
+
+std::string getExecutablePath() {
+  uint32_t size = 0;
+  _NSGetExecutablePath(nullptr, &size);
+
+  std::string path(size, '\0');
+  if (_NSGetExecutablePath(path.data(), &size) != 0) {
+    throw std::runtime_error("failed to determine test executable path");
+  }
+
+  path.resize(std::strlen(path.c_str()));
+  return path;
+}
+
+int runSelfWithFilter(std::string_view filter) {
+  std::string executable = getExecutablePath();
+  std::string filterArg = "--gtest_filter=" + std::string(filter);
+
+  std::array<char*, 3> argv{executable.data(), filterArg.data(), nullptr};
+  pid_t pid = 0;
+  int spawnErr = posix_spawn(
+      &pid, executable.c_str(), nullptr, nullptr, argv.data(), environ);
+  if (spawnErr != 0) {
+    return spawnErr;
+  }
+
+  int status = 0;
+  if (waitpid(pid, &status, 0) == -1) {
+    return errno;
+  }
+
+  if (WIFEXITED(status)) {
+    return WEXITSTATUS(status);
+  }
+  if (WIFSIGNALED(status)) {
+    return 128 + WTERMSIG(status);
+  }
+  return 255;
+}
+
+void runConcurrentEvictionStress(ThrustJIT* jit) {
+  const std::string irTmpl = R"IR(
+        define i64 @function_name(i64 noundef %0, i64 noundef %1)  {
+        %3 = add nsw i64 %1, %0
+        ret i64 %3
+        }
+    )IR";
+
+  jit->GetCache().clear();
+  jit->SetMemoryLimit(kStressLimit);
+
+  std::atomic<int> errors{0};
+
+  auto worker = [&](int threadId) {
+    for (int i = 0; i < kStressModulesPerThread; ++i) {
+      std::string fn =
+          "stress_t" + std::to_string(threadId) + "_f" + std::to_string(i);
+      std::regex p("function_name");
+      std::string ir = std::regex_replace(irTmpl, p, fn);
+
+      auto tsm = jit->CreateTSModule(fn);
+      tsm.withModuleDo([&](llvm::Module& m) {
+        bool err = jit->AddIRIntoModule(ir.c_str(), &m);
+        if (err) {
+          errors.fetch_add(1, std::memory_order_relaxed);
+        }
+      });
+
+      CompiledModuleSP mod = jit->CompileModule(std::move(tsm));
+      if (!mod) {
+        errors.fetch_add(1, std::memory_order_relaxed);
+        continue;
+      }
+
+      typedef int64_t (*FuncProto)(int64_t, int64_t);
+      auto jitFunc = (FuncProto)mod->getFuncPtr(fn);
+      if (jitFunc) {
+        auto result = jitFunc(100, 200);
+        EXPECT_EQ(result, 300);
+      }
+    }
+  };
+
+  std::vector<std::jthread> threads;
+  for (int t = 0; t < kStressThreads; ++t) {
+    threads.emplace_back(worker, t);
+  }
+  for (auto&& t : threads) {
+    t.join();
+  }
+
+  EXPECT_EQ(errors.load(), 0);
+  EXPECT_LT(jit->GetMemoryUsage(), 8 * kStressLimit);
+}
+
+} // namespace
 
 class JitEngineTest : public ::testing::Test {
  public:
@@ -327,72 +437,64 @@ TEST_F(JitEngineTest, cacheEvictionOnEmptyList) {
 }
 
 TEST_F(JitEngineTest, concurrentEvictionStress) {
-  // Stress test: tiny cache limit + many unique modules + concurrent compiles.
-  // Verifies that:
-  //   1. Memory usage stays bounded after eviction.
-  //   2. No "Resource tracker became defunct" errors during the run.
-  //   3. No MemMgrs.empty() assertion on teardown.
-  const std::string irTmpl = R"IR(
-        define i64 @function_name(i64 noundef %0, i64 noundef %1)  {
+  runConcurrentEvictionStress(jit);
+}
+
+TEST_F(JitEngineTest, concurrentEvictionStressChild) {
+  runConcurrentEvictionStress(jit);
+}
+
+TEST_F(JitEngineTest, concurrentEvictionStressSubprocess) {
+  for (int i = 0; i < 10; ++i) {
+    SCOPED_TRACE("subprocess iteration " + std::to_string(i));
+    EXPECT_EQ(runSelfWithFilter(kStressFilter), 0);
+  }
+}
+
+TEST_F(JitEngineTest, moduleOutlivesCache) {
+  // Reproduces a crash during static destruction: a CompiledModuleSP outlives
+  // the ThrustJIT singleton's lruCache_.clear() in ~ThrustJIT.  When the
+  // stale CompiledModuleImpl is finally destroyed, its memoryUsageCounter_
+  // or ResourceTracker points into freed memory → SIGSEGV.
+  //
+  // Simulates the scenario by:
+  //   1. Compiling a module (refcount: cache + local)
+  //   2. Clearing the cache (drops cache's ref, but local keeps it alive)
+  //   3. Destroying the local → ~CompiledModuleImpl runs after cleanup
+  const std::string ir = R"IR(
+        define i64 @outlives_test(i64 noundef %0, i64 noundef %1)  {
         %3 = add nsw i64 %1, %0
         ret i64 %3
         }
     )IR";
 
-  constexpr size_t LIMIT = 1024;
-  constexpr int NUM_THREADS = 16;
-  constexpr int MODULES_PER_THREAD = 32;
   jit->GetCache().clear();
-  jit->SetMemoryLimit(LIMIT);
+  jit->SetMemoryLimit(1L << 30);
 
-  std::atomic<int> errors{0};
-
-  auto worker = [&](int threadId) {
-    for (int i = 0; i < MODULES_PER_THREAD; ++i) {
-      std::string fn =
-          "stress_t" + std::to_string(threadId) + "_f" + std::to_string(i);
-      std::regex p("function_name");
-      std::string ir = std::regex_replace(irTmpl, p, fn);
-
-      auto tsm = jit->CreateTSModule(fn);
-      tsm.withModuleDo([&](llvm::Module& m) {
-        bool err = jit->AddIRIntoModule(ir.c_str(), &m);
-        if (err) {
-          errors.fetch_add(1, std::memory_order_relaxed);
-          return;
-        }
-      });
-
-      CompiledModuleSP mod = jit->CompileModule(std::move(tsm));
-      if (!mod) {
-        errors.fetch_add(1, std::memory_order_relaxed);
-        continue;
-      }
-
-      typedef int64_t (*FuncProto)(int64_t, int64_t);
-      auto jitFunc = (FuncProto)mod->getFuncPtr(fn);
-      if (jitFunc) {
-        auto result = jitFunc(100, 200);
-        EXPECT_EQ(result, 300);
-      }
-    }
-  };
-
-  std::vector<std::jthread> threads;
-  for (int t = 0; t < NUM_THREADS; ++t) {
-    threads.emplace_back(worker, t);
-  }
-  for (auto&& t : threads) {
-    t.join();
+  CompiledModuleSP mod;
+  {
+    auto tsm = jit->CreateTSModule("outlives_test");
+    tsm.withModuleDo([&](llvm::Module& m) {
+      bool err = jit->AddIRIntoModule(ir.c_str(), &m);
+      ASSERT_FALSE(err);
+    });
+    mod = jit->CompileModule(std::move(tsm));
+    ASSERT_TRUE(mod != nullptr);
   }
 
-  EXPECT_EQ(errors.load(), 0);
+  // Verify the function works while alive.
+  typedef int64_t (*FuncProto)(int64_t, int64_t);
+  auto jitFunc = (FuncProto)mod->getFuncPtr("outlives_test");
+  ASSERT_TRUE(jitFunc != nullptr);
+  ASSERT_EQ(jitFunc(40, 2), 42);
 
-  // After all threads complete, memory should be bounded.
-  // Upper bound: each module ~768 bytes; with LIMIT=1024, at most a few
-  // modules' worth should remain.  Use a generous 8x margin to account
-  // for concurrency timing.
-  EXPECT_LT(jit->GetMemoryUsage(), 8 * LIMIT);
+  // Simulate the singleton teardown sequence: clear cache first, then the
+  // local `mod` is destroyed after.  This is what happens during static
+  // destruction when the test holds a CompiledModuleSP on the stack.
+  jit->GetCache().clear();
+
+  // mod still alive here (refcount 1).  When it goes out of scope at the
+  // end of this test, ~CompiledModuleImpl must not crash.
 }
 
 } // namespace bytedance::bolt::jit::test
