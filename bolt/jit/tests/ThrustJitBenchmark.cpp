@@ -37,7 +37,7 @@ const std::string kIrTemplate = R"IR(
     }
 )IR";
 
-constexpr size_t kNoEvictLimit = 1L << 30; // 1 GB – prevents eviction
+constexpr size_t kNoEvictLimit = 1L << 30; // 1 GB - prevents eviction
 
 ThrustJIT* getJit() {
   return ThrustJIT::getInstance();
@@ -57,81 +57,35 @@ void compileModules(ThrustJIT* jit, size_t iters, const std::string& prefix) {
   }
 }
 
-// ---- Sequential benchmarks ------------------------------------------------
+// ---- Sequential compile (no eviction) ------------------------------------
 
-BENCHMARK(SeqCompile_NoFence, iters) {
+BENCHMARK(SeqCompile, iters) {
   folly::BenchmarkSuspender suspender;
   auto* jit = getJit();
   jit->GetCache().clear();
   jit->SetMemoryLimit(kNoEvictLimit);
-  jit->SetEmitFenceMode(ThrustJIT::EmitFenceMode::kNone);
   suspender.dismiss();
 
-  compileModules(jit, iters, "nf_seq_");
-}
-
-BENCHMARK_RELATIVE(SeqCompile_PerPool, iters) {
-  folly::BenchmarkSuspender suspender;
-  auto* jit = getJit();
-  jit->GetCache().clear();
-  jit->SetMemoryLimit(kNoEvictLimit);
-  jit->SetEmitFenceMode(ThrustJIT::EmitFenceMode::kPerPool);
-  suspender.dismiss();
-
-  compileModules(jit, iters, "cb_seq_");
-}
-
-BENCHMARK_RELATIVE(SeqCompile_PerModule, iters) {
-  folly::BenchmarkSuspender suspender;
-  auto* jit = getJit();
-  jit->GetCache().clear();
-  jit->SetMemoryLimit(kNoEvictLimit);
-  jit->SetEmitFenceMode(ThrustJIT::EmitFenceMode::kPerModule);
-  suspender.dismiss();
-
-  compileModules(jit, iters, "pm_seq_");
+  compileModules(jit, iters, "seq_");
 }
 
 BENCHMARK_DRAW_LINE();
 
-// ---- Sequential benchmarks with eviction ----------------------------------
+// ---- Sequential compile with eviction ------------------------------------
 
-BENCHMARK(SeqCompileEvict_NoFence, iters) {
+BENCHMARK(SeqCompileEvict, iters) {
   folly::BenchmarkSuspender suspender;
   auto* jit = getJit();
   jit->GetCache().clear();
   jit->SetMemoryLimit(1024);
-  jit->SetEmitFenceMode(ThrustJIT::EmitFenceMode::kNone);
   suspender.dismiss();
 
-  compileModules(jit, iters, "nf_evict_");
-}
-
-BENCHMARK_RELATIVE(SeqCompileEvict_PerPool, iters) {
-  folly::BenchmarkSuspender suspender;
-  auto* jit = getJit();
-  jit->GetCache().clear();
-  jit->SetMemoryLimit(1024);
-  jit->SetEmitFenceMode(ThrustJIT::EmitFenceMode::kPerPool);
-  suspender.dismiss();
-
-  compileModules(jit, iters, "cb_evict_");
-}
-
-BENCHMARK_RELATIVE(SeqCompileEvict_PerModule, iters) {
-  folly::BenchmarkSuspender suspender;
-  auto* jit = getJit();
-  jit->GetCache().clear();
-  jit->SetMemoryLimit(1024);
-  jit->SetEmitFenceMode(ThrustJIT::EmitFenceMode::kPerModule);
-  suspender.dismiss();
-
-  compileModules(jit, iters, "pm_evict_");
+  compileModules(jit, iters, "evict_");
 }
 
 BENCHMARK_DRAW_LINE();
 
-// ---- Concurrent benchmarks ------------------------------------------------
+// ---- Concurrent compile --------------------------------------------------
 
 constexpr int kConcThreads = 8;
 
@@ -160,37 +114,14 @@ void concurrentCompile(
   }
 }
 
-BENCHMARK(ConcCompile_NoFence, iters) {
+BENCHMARK(ConcCompile, iters) {
   folly::BenchmarkSuspender suspender;
   auto* jit = getJit();
   jit->GetCache().clear();
   jit->SetMemoryLimit(kNoEvictLimit);
-  jit->SetEmitFenceMode(ThrustJIT::EmitFenceMode::kNone);
   suspender.dismiss();
 
-  concurrentCompile(jit, iters, "nf_conc_");
-}
-
-BENCHMARK_RELATIVE(ConcCompile_PerPool, iters) {
-  folly::BenchmarkSuspender suspender;
-  auto* jit = getJit();
-  jit->GetCache().clear();
-  jit->SetMemoryLimit(kNoEvictLimit);
-  jit->SetEmitFenceMode(ThrustJIT::EmitFenceMode::kPerPool);
-  suspender.dismiss();
-
-  concurrentCompile(jit, iters, "cb_conc_");
-}
-
-BENCHMARK_RELATIVE(ConcCompile_PerModule, iters) {
-  folly::BenchmarkSuspender suspender;
-  auto* jit = getJit();
-  jit->GetCache().clear();
-  jit->SetMemoryLimit(kNoEvictLimit);
-  jit->SetEmitFenceMode(ThrustJIT::EmitFenceMode::kPerModule);
-  suspender.dismiss();
-
-  concurrentCompile(jit, iters, "pm_conc_");
+  concurrentCompile(jit, iters, "conc_");
 }
 
 } // namespace

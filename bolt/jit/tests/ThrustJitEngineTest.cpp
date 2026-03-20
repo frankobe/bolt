@@ -43,7 +43,6 @@
 #include <thread>
 
 extern "C" {
-
 extern char** environ;
 
 int64_t extern_test_sum(int64_t a, int64_t b) {
@@ -61,8 +60,9 @@ namespace {
 constexpr size_t kStressLimit = 1024;
 constexpr int kStressThreads = 16;
 constexpr int kStressModulesPerThread = 32;
+constexpr int kStressSubprocessRuns = 50;
 constexpr std::string_view kStressFilter =
-    "JitEngineTest.concurrentEvictionStressChild";
+    "JitEngineTest.concurrentEvictionStress";
 
 std::string getExecutablePath() {
   uint32_t size = 0;
@@ -77,21 +77,24 @@ std::string getExecutablePath() {
   return path;
 }
 
-int runSelfWithFilter(std::string_view filter) {
+pid_t spawnStressSubprocess() {
   std::string executable = getExecutablePath();
-  std::string filterArg = "--gtest_filter=" + std::string(filter);
-
+  std::string filterArg = "--gtest_filter=" + std::string(kStressFilter);
   std::array<char*, 3> argv{executable.data(), filterArg.data(), nullptr};
+
   pid_t pid = 0;
   int spawnErr = posix_spawn(
       &pid, executable.c_str(), nullptr, nullptr, argv.data(), environ);
   if (spawnErr != 0) {
-    return spawnErr;
+    throw std::runtime_error("failed to spawn stress subprocess");
   }
+  return pid;
+}
 
+int waitForSubprocess(pid_t pid) {
   int status = 0;
   if (waitpid(pid, &status, 0) == -1) {
-    return errno;
+    throw std::runtime_error("failed to wait for stress subprocess");
   }
 
   if (WIFEXITED(status)) {
@@ -103,7 +106,10 @@ int runSelfWithFilter(std::string_view filter) {
   return 255;
 }
 
-void runConcurrentEvictionStress(ThrustJIT* jit) {
+void runConcurrentEvictionStress(
+    ThrustJIT* jit,
+    int numThreads = kStressThreads,
+    int modulesPerThread = kStressModulesPerThread) {
   const std::string irTmpl = R"IR(
         define i64 @function_name(i64 noundef %0, i64 noundef %1)  {
         %3 = add nsw i64 %1, %0
@@ -117,7 +123,7 @@ void runConcurrentEvictionStress(ThrustJIT* jit) {
   std::atomic<int> errors{0};
 
   auto worker = [&](int threadId) {
-    for (int i = 0; i < kStressModulesPerThread; ++i) {
+    for (int i = 0; i < modulesPerThread; ++i) {
       std::string fn =
           "stress_t" + std::to_string(threadId) + "_f" + std::to_string(i);
       std::regex p("function_name");
@@ -146,12 +152,12 @@ void runConcurrentEvictionStress(ThrustJIT* jit) {
     }
   };
 
-  std::vector<std::jthread> threads;
-  for (int t = 0; t < kStressThreads; ++t) {
-    threads.emplace_back(worker, t);
+  std::vector<std::jthread> workers;
+  for (int t = 0; t < numThreads; ++t) {
+    workers.emplace_back(worker, t);
   }
-  for (auto&& t : threads) {
-    t.join();
+  for (auto&& workerThread : workers) {
+    workerThread.join();
   }
 
   EXPECT_EQ(errors.load(), 0);
@@ -440,14 +446,17 @@ TEST_F(JitEngineTest, concurrentEvictionStress) {
   runConcurrentEvictionStress(jit);
 }
 
-TEST_F(JitEngineTest, concurrentEvictionStressChild) {
-  runConcurrentEvictionStress(jit);
-}
+TEST(JitEngineSubprocessTest, concurrentEvictionStressSubprocess) {
+  std::vector<pid_t> pids;
+  pids.reserve(kStressSubprocessRuns);
 
-TEST_F(JitEngineTest, concurrentEvictionStressSubprocess) {
-  for (int i = 0; i < 10; ++i) {
+  for (int i = 0; i < kStressSubprocessRuns; ++i) {
+    pids.push_back(spawnStressSubprocess());
+  }
+
+  for (int i = 0; i < kStressSubprocessRuns; ++i) {
     SCOPED_TRACE("subprocess iteration " + std::to_string(i));
-    EXPECT_EQ(runSelfWithFilter(kStressFilter), 0);
+    EXPECT_EQ(waitForSubprocess(pids[i]), 0);
   }
 }
 
